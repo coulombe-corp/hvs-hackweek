@@ -1,0 +1,108 @@
+# Hackweek project of using federated identity with GitHub and HVS AWS dynamic credentials to build a deployment pipeline
+# with 0 long-lived or human-managed sensitive values.
+#
+# Pre-requisites:
+# - A HashiCorp Cloud Platform (HCP) Service Principal with the 'Vault Secrets App Secret Reader' role
+# - A OIDC provider for that Service Principal that accepts federated tokens from GitHub
+#    - issuer: https://token.actions.githubusercontent.com
+#    - service-principal: iam/project/<your-project>>/service-principal/<your-sp-name>
+#    - allowed-audience: https://idp.hashicorp.com
+#    - conditional-access: 'jwt_claims.sub == "repo:<your-gh-org>>/<your-gh-repo>:ref:refs/heads/main"'
+# - A HCP Vault Secrets AWS dynamic secret with permissions to apply the Terraform project (S3 write)
+
+# User outcome:
+# - Users should be able to deploy their workflows and apps without relying on long-lived static secrets like a SP client secret
+
+name: Secretless Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+
+    # Steps are exploded and use raw HTTP requests to demonstrate the process. A user-facing solution would use a
+    # HashiCorp-managed GitHub Action or CLI to internalize these steps.
+    steps:
+      - name: Generate federated token
+        id: generate-federated-token
+        run: |
+          GH_FEDERATED_TOKEN=$(curl -X GET "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://idp.hashicorp.com" \
+          -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          | jq -r '.value')
+          echo "GH_FEDERATED_TOKEN=$GH_FEDERATED_TOKEN" >> $GITHUB_ENV
+
+      - name: Exchange federated for HCP bearer token
+        id: exchange-token
+        run: |
+          HCP_TOKEN=$(curl -X POST "https://api.cloud.hashicorp.com/2019-12-10/iam/project/${{ vars.HCP_PROJ_ID }}/service-principal/${{ vars.HCP_SP_NAME }}/workload-identity-provider/${{ vars.HCP_PROVIDER_NAME }}/exchange-token" \
+          -H "Content-Type: application/json" \
+          --data-raw "{
+            \"jwt_token\": \"$GH_FEDERATED_TOKEN\"
+          }" \
+          | jq -r .access_token)
+          echo "HCP_TOKEN=$HCP_TOKEN" >> $GITHUB_ENV
+
+      - name: Open dynamic secret
+        id: open-dynamic-secret
+        run: |
+          DYNAMIC_SECRET=$(curl -X GET "https://api.cloud.hashicorp.com/secrets/2023-11-28/organizations/${{ vars.HCP_ORG_ID }}/projects/${{ vars.HCP_PROJ_ID }}/apps/${{ vars.HCP_APP_NAME }}/secrets/${{ vars.HCP_SECRET_NAME }}:open" \
+          -H "Authorization: Bearer $HCP_TOKEN")
+          echo "AWS_ACCESS_KEY_ID=$(echo $DYNAMIC_SECRET | jq -r .secret.dynamic_instance.values.access_key_id)" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $DYNAMIC_SECRET | jq -r .secret.dynamic_instance.values.secret_access_key)" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $DYNAMIC_SECRET | jq -r .secret.dynamic_instance.values.session_token)" >> $GITHUB_ENV
+
+      # Standard Terraform deploy steps just to prove the steps above worked
+      - name: Checkout code
+        id: checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Terraform
+        id: set-up-terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.4
+
+      - name: Apply Terraform
+        id: apply-terraform
+        run: |
+          cd terraform
+          terraform init
+          terraform apply -var="access_key_id=$AWS_ACCESS_KEY_ID" -auto-approve
+
+#      The federated token exchange replaces the usual approach of creating a bearer token via a SP client ID & secret
+#      These SP credentials must be bootstrapped, tracked and rotated. They do not expire automatically making them
+#      a security risk if leaked.
+#
+#      - name: Exchange SP credentials for HCP bearer token
+#        id: exchange-token
+#        run: |
+#          HCP_TOKEN=$(curl --location "https://auth.idp.hashicorp.com/oauth2/token" \
+#          --header "Content-Type: application/x-www-form-urlencoded" \
+#          --data-urlencode "client_id=${{ secrets.HCP_SP_CLIENT_ID }}" \
+#          --data-urlencode "client_secret=${{ secrets.HCP_SP_CLIENT_SECRET }}" \
+#          --data-urlencode "grant_type=client_credentials" \
+#          --data-urlencode "audience=https://api.hashicorp.cloud" | jq -r .access_token)
+#          echo "HCP_TOKEN=$HCP_TOKEN" >> $GITHUB_ENV
+
+#      The token exchange steps will be packaged into a HashiCorp-managed GitHub Action or CLI to simplify the process.
+#      The example below shows what it'd look like for your users to accomplish the same result from the steps above
+
+#      - name: Open Hashicorp Vault Secrets
+#        id: ope-hashicorp-vault-secrets
+#        uses: hashicorp/vault-secrets-action@main
+#        with:
+#          SERVICE_PRINCIPAL_NAME: ${{ vars.HCP_SP_NAME }}
+#          PROVIDER_NAME: ${{ vars.HCP_PROVIDER_NAME }}
+#          ORGANIZATION_NAME: ${{ vars.HCP_ORG_ID }}
+#          PROJECT_NAME: ${{ vars.HCP_PROJ_ID }}
+#          APP_NAME: ${{ vars.HCP_APP_NAME }}
+#          SECRET_NAMES: '["${{ vars.HCP_SECRET_NAME }}"]'
+#          SET_IN_ENV: true
