@@ -8,7 +8,7 @@
 #    - service-principal: iam/project/<your-project>>/service-principal/<your-sp-name>
 #    - allowed-audience: https://idp.hashicorp.com
 #    - conditional-access: 'jwt_claims.sub == "repo:<your-gh-org>>/<your-gh-repo>:ref:refs/heads/main"'
-# - A HCP Vault Secrets AWS dynamic secret with permissions to apply the Terraform project (S3 write)
+# - HCP Vault Secrets AWS credentials with permissions to apply the Terraform project (S3 write)
 
 # User outcome:
 # - Users should be able to deploy their workflows and apps without relying on long-lived static secrets like a SP client secret
